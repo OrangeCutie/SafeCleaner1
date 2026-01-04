@@ -1,149 +1,147 @@
 import discord
 from discord.ext import commands
-from better_profanity import profanity
-import json
-import re
 import os
-from datetime import datetime, date
+import json
+from datetime import datetime, timezone
+import openai
+from better_profanity import profanity
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Railway environment variable
-MAX_WARNINGS = 4
+# Load environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-NSFW_KEYWORDS = ["condo", "erp", "nsfw", "lewd", "explicit", "cp"]
-INVITE_REGEX = re.compile(r"(discord\.gg|discord\.com/invite)/[A-Za-z0-9]+")
+if BOT_TOKEN is None or OPENAI_API_KEY is None:
+    raise ValueError("BOT_TOKEN or OPENAI_API_KEY is not set in environment variables.")
+
+openai.api_key = OPENAI_API_KEY
+profanity.load_censor_words()  # Load default bad words
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.members = True
+intents.messages = True
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-profanity.load_censor_words()
-DATA_FILE = "warnings.json"
-warnings = {}
+# Load or create warnings.json
+WARNINGS_FILE = "warnings.json"
+if not os.path.exists(WARNINGS_FILE):
+    with open(WARNINGS_FILE, "w") as f:
+        json.dump({}, f)
 
-def load_data():
-    global warnings
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            warnings.update(json.load(f))
+def load_warnings():
+    with open(WARNINGS_FILE, "r") as f:
+        return json.load(f)
 
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(warnings, f, indent=2)
+def save_warnings(warnings):
+    with open(WARNINGS_FILE, "w") as f:
+        json.dump(warnings, f, indent=4)
 
-def log_warning(guild, member, reason, message_content, warning_count):
-    os.makedirs("logs", exist_ok=True)
-    today = date.today().isoformat()
-    log_file = f"logs/{today}.txt"
-    clean_content = message_content.replace("\n", " ")[:500]
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(
-            f"[{datetime.utcnow().isoformat()} UTC]\n"
-            f"Server: {guild.name} ({guild.id})\n"
-            f"User: {member} ({member.id})\n"
-            f"Warnings: {warning_count}/{MAX_WARNINGS}\n"
-            f"Reason: {reason}\n"
-            f"Message: {clean_content}\n"
-            f"{'-'*40}\n"
-        )
+# ----- Commands -----
+@bot.command(name="warn")
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx, member: discord.Member, *, reason=None):
+    warnings = load_warnings()
+    user_id = str(member.id)
 
-def add_warning(member, guild, reason, message_content):
-    gid = str(guild.id)
-    uid = str(member.id)
-    warnings.setdefault(gid, {})
-    warnings[gid].setdefault(uid, {"user": str(member), "count":0, "reasons":[]})
+    if user_id not in warnings:
+        warnings[user_id] = []
 
-    warnings[gid][uid]["count"] += 1
-    warnings[gid][uid]["reasons"].append({
-        "reason": reason,
-        "message": message_content,
-        "time": datetime.utcnow().isoformat()
+    warnings[user_id].append({
+        "reason": reason if reason else "No reason provided",
+        "moderator": ctx.author.name,
+        "time": datetime.now(timezone.utc).isoformat()
     })
-    save_data()
-    log_warning(guild, member, reason, message_content, warnings[gid][uid]["count"])
-    return warnings[gid][uid]["count"]
 
-@bot.event
-async def on_ready():
-    load_data()
-    print(f"Bot logged in as {bot.user}")
+    save_warnings(warnings)
+    await ctx.send(f"{member.mention} has been warned. Total warnings: {len(warnings[user_id])}")
 
-@bot.event
-async def on_message(message):
-    if message.author.bot or not isinstance(message.author, discord.Member):
+@bot.command(name="seewarnings")
+async def seewarnings(ctx, member: discord.Member):
+    warnings = load_warnings()
+    user_id = str(member.id)
+
+    if user_id not in warnings or len(warnings[user_id]) == 0:
+        await ctx.send(f"{member.mention} has no warnings.")
         return
 
-    content = message.content.lower()
-    reason = None
+    msg = f"Warnings for {member.mention}:\n"
+    for i, w in enumerate(warnings[user_id], start=1):
+        msg += f"{i}. {w['reason']} (by {w['moderator']} at {w['time']})\n"
 
-    if profanity.contains_profanity(content):
-        reason = "Profanity / slur detected"
+    await ctx.send(msg)
 
-    for word in NSFW_KEYWORDS:
-        if word in content:
-            reason = "NSFW / condo-related keyword detected"
+@bot.command(name="unban")
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, *, member_name):
+    banned_users = await ctx.guild.bans()
+    name, discrim = member_name.split("#")
+    for ban_entry in banned_users:
+        user = ban_entry.user
+        if (user.name, user.discriminator) == (name, discrim):
+            await ctx.guild.unban(user)
+            await ctx.send(f"{user.mention} has been unbanned.")
+            return
+    await ctx.send(f"No banned user found with name {member_name}.")
 
-    if INVITE_REGEX.search(content):
-        reason = "Suspicious Discord invite detected"
+# ----- AI Reply & Profanity Handling -----
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
-    if reason:
-        count = add_warning(message.author, message.guild, reason, message.content)
-        await message.delete()
-        await message.channel.send(
-            f"⚠️ {message.author.mention} warning **{count}/{MAX_WARNINGS}**: {reason}",
-            delete_after=6
-        )
+    # Check for profanity
+    if profanity.contains_profanity(message.content):
+        warnings = load_warnings()
+        user_id = str(message.author.id)
 
-        if count >= MAX_WARNINGS:
-            owner = message.guild.owner
-            if owner:
-                try:
-                    await owner.send(
-                        f"🚨 AUTO-BAN ALERT\nServer: {message.guild.name}\n"
-                        f"User: {message.author} ({message.author.id})\n"
-                        f"Warnings: {count}/{MAX_WARNINGS}\nReason: Repeated violations"
-                    )
-                except:
-                    pass
-            await message.guild.ban(message.author, reason="Reached maximum warnings")
+        if user_id not in warnings:
+            warnings[user_id] = []
+
+        warnings[user_id].append({
+            "reason": "Used inappropriate language",
+            "moderator": bot.user.name,
+            "time": datetime.now(timezone.utc).isoformat()
+        })
+
+        save_warnings(warnings)
+        try:
+            await message.delete()
+            await message.channel.send(f"{message.author.mention}, inappropriate language is not allowed. Warning added.")
+        except discord.errors.Forbidden:
+            await message.channel.send(f"{message.author.mention}, I cannot delete messages. But warning is recorded.")
+
+    # Handle AI ping
+    if bot.user in message.mentions:
+        prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        if prompt:
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=150
+                )
+                reply = response.choices[0].message.content
+                await message.reply(reply)
+            except Exception as e:
+                await message.reply(f"AI error: {str(e)}")
 
     await bot.process_commands(message)
 
-@bot.command()
-@commands.has_permissions(kick_members=True)
-async def warnings_cmd(ctx, member: discord.Member):
-    gid = str(ctx.guild.id)
-    uid = str(member.id)
-    if gid not in warnings or uid not in warnings[gid]:
-        await ctx.send("User has no warnings.")
-        return
-    data = warnings[gid][uid]
-    msg = f"⚠️ **{member}** — {data['count']} warnings\n"
-    for r in data["reasons"]:
-        msg += f"- {r['reason']} ({r['time']})\n"
-    await ctx.send(msg)
+# ----- Error Handling -----
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"You don't have permission to run this command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing arguments. Usage: {ctx.command}")
+    else:
+        await ctx.send(f"An error occurred: {error}")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def export(ctx):
-    gid = str(ctx.guild.id)
-    with open(f"flagged_{gid}.txt", "w", encoding="utf-8") as f:
-        if gid in warnings:
-            for u in warnings[gid].values():
-                f.write(f"{u['user']} — {u['count']} warnings\n")
-                for r in u["reasons"]:
-                    f.write(f"  - {r['reason']}\n")
-                f.write("\n")
-    await ctx.send("📄 Exported flagged users for this server.")
+# ----- Ready Event -----
+@bot.event
+async def on_ready():
+    print(f"Bot logged in as {bot.user}!")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def todaylog(ctx):
-    today = date.today().isoformat()
-    path = f"logs/{today}.txt"
-    if not os.path.exists(path):
-        await ctx.send("No logs for today.")
-        return
-    await ctx.send(file=discord.File(path))
-
+# Run the bot
 bot.run(BOT_TOKEN)

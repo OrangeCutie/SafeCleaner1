@@ -1,76 +1,135 @@
 import discord
 from discord.ext import commands
+import os, json, re
+from datetime import datetime
 from better_profanity import profanity
-import os
+from dotenv import load_dotenv
 import openai
+import asyncio
 
-intents = discord.Intents.default()
-intents.messages = True
-intents.guilds = True
-intents.members = True
-intents.message_content = True
+load_dotenv()
 
+TOKEN = os.getenv("DISCORD_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_KEY
+
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Load environment variables
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+WARN_LIMIT = 4
+DATA_FILE = "warnings.json"
+LOG_DIR = "logs"
+FILTER_DIR = "filter"
 
-# Profanity setup
-profanity.load_censor_words()  # can customize your list if needed
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# Simple warnings system (memory for example)
-warnings = {}
+# ---------- LOAD FILTERS ----------
+profanity.load_censor_words()
+extra_words = []
 
-# --- Events ---
+for file in os.listdir(FILTER_DIR):
+    if file.endswith(".txt"):
+        with open(os.path.join(FILTER_DIR, file), encoding="utf-8") as f:
+            extra_words.extend([w.strip() for w in f if w.strip()])
+
+profanity.add_censor_words(extra_words)
+
+# ---------- HELPERS ----------
+def save_warnings(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def load_warnings():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE) as f:
+        return json.load(f)
+
+def normalize(text):
+    return re.sub(r"[^a-zA-Z0-9]", "", text.lower())
+
+# ---------- EVENTS ----------
 @bot.event
 async def on_ready():
-    print(f"Bot logged in as {bot.user}")
+    print(f"Logged in as {bot.user}")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Profanity filter
-    if profanity.contains_profanity(message.content):
-        await message.delete()
-        user_id = message.author.id
-        warnings[user_id] = warnings.get(user_id, 0) + 1
+    content = normalize(message.content)
+
+    if profanity.contains_profanity(content):
+        try:
+            await message.delete()
+        except:
+            return
+
+        data = load_warnings()
+        uid = str(message.author.id)
+        data.setdefault(uid, 0)
+        data[uid] += 1
+        save_warnings(data)
+
+        log_file = f"{LOG_DIR}/{datetime.utcnow().date()}.txt"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{message.author} | Warn {data[uid]} | {message.content}\n")
+
         await message.channel.send(
-            f"{message.author.mention}, watch your language! Warnings: {warnings[user_id]}"
+            f"{message.author.mention} ⚠ Warning {data[uid]}/{WARN_LIMIT}"
         )
+
+        if data[uid] >= WARN_LIMIT:
+            try:
+                await message.author.ban(reason="Too many warnings")
+                await message.guild.owner.send(
+                    f"🚫 {message.author} was banned for reaching {WARN_LIMIT} warnings."
+                )
+            except:
+                pass
+
         return
 
     await bot.process_commands(message)
 
-# --- Commands ---
+# ---------- COMMANDS ----------
 @bot.command()
-async def seewarnings(ctx, member: discord.Member):
-    count = warnings.get(member.id, 0)
-    await ctx.send(f"{member.display_name} has {count} warnings.")
+@commands.has_permissions(manage_guild=True)
+async def warnings(ctx, member: discord.Member):
+    data = load_warnings()
+    await ctx.send(f"{member.mention} has {data.get(str(member.id), 0)} warnings.")
+
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def clearwarnings(ctx, member: discord.Member):
+    data = load_warnings()
+    data[str(member.id)] = 0
+    save_warnings(data)
+    await ctx.send(f"Warnings cleared for {member.mention}")
 
 @bot.command()
 @commands.has_permissions(ban_members=True)
-async def unban(ctx, *, member_name):
-    banned_users = await ctx.guild.bans()
-    for ban_entry in banned_users:
-        user = ban_entry.user
-        if user.name == member_name:
-            await ctx.guild.unban(user)
-            await ctx.send(f"Unbanned {user.name}")
-            return
-    await ctx.send(f"User {member_name} not found.")
+async def unban(ctx, user_id: int):
+    user = await bot.fetch_user(user_id)
+    await ctx.guild.unban(user)
+    await ctx.send(f"Unbanned {user}")
 
+# ---------- AI CHAT ----------
 @bot.command()
 async def ask(ctx, *, question):
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"user", "content":question}]
-    )
-    answer = response.choices[0].message.content
-    await ctx.send(answer)
+    await ctx.send("🤖 Thinking...")
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role":"user","content": question}],
+            max_tokens=300,
+            temperature=0.7
+        )
+        answer = response['choices'][0]['message']['content'].strip()
+        await ctx.send(f"💡 {answer}")
+    except Exception as e:
+        await ctx.send(f"⚠ Error: {str(e)}")
 
-# --- Run Bot ---
-bot.run(DISCORD_TOKEN)
+# ---------- RUN ----------
+bot.run(TOKEN)

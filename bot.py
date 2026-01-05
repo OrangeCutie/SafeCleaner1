@@ -1,54 +1,34 @@
 import discord
-from discord.ext import commands
-import os, json, re
-from datetime import datetime
-from better_profanity import profanity
+import json
+import os
+from moderation import behavior_score
 from dotenv import load_dotenv
-import openai
-import asyncio
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_KEY
 
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 
-WARN_LIMIT = 4
-DATA_FILE = "warnings.json"
-LOG_DIR = "logs"
-FILTER_DIR = "filter"
+bot = discord.Client(intents=intents)
 
-os.makedirs(LOG_DIR, exist_ok=True)
+WARN_FILE = "warnings.json"
 
-# ---------- LOAD FILTERS ----------
-profanity.load_censor_words()
-extra_words = []
-
-for file in os.listdir(FILTER_DIR):
-    if file.endswith(".txt"):
-        with open(os.path.join(FILTER_DIR, file), encoding="utf-8") as f:
-            extra_words.extend([w.strip() for w in f if w.strip()])
-
-profanity.add_censor_words(extra_words)
-
-# ---------- HELPERS ----------
-def save_warnings(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_warnings():
-    if not os.path.exists(DATA_FILE):
+def load_warns():
+    if not os.path.exists(WARN_FILE):
         return {}
-    with open(DATA_FILE) as f:
+    with open(WARN_FILE, "r") as f:
         return json.load(f)
 
-def normalize(text):
-    return re.sub(r"[^a-zA-Z0-9]", "", text.lower())
+def save_warns(data):
+    with open(WARN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ---------- EVENTS ----------
+def is_admin(member):
+    return member.guild_permissions.administrator
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -58,78 +38,81 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    content = normalize(message.content)
+    warns = load_warns()
+    uid = str(message.author.id)
 
-    if profanity.contains_profanity(content):
-        try:
-            await message.delete()
-        except:
-            return
-
-        data = load_warnings()
-        uid = str(message.author.id)
-        data.setdefault(uid, 0)
-        data[uid] += 1
-        save_warnings(data)
-
-        log_file = f"{LOG_DIR}/{datetime.utcnow().date()}.txt"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"{message.author} | Warn {data[uid]} | {message.content}\n")
-
-        await message.channel.send(
-            f"{message.author.mention} ⚠ Warning {data[uid]}/{WARN_LIMIT}"
-        )
-
-        if data[uid] >= WARN_LIMIT:
-            try:
-                await message.author.ban(reason="Too many warnings")
-                await message.guild.owner.send(
-                    f"🚫 {message.author} was banned for reaching {WARN_LIMIT} warnings."
-                )
-            except:
-                pass
-
+    # ---- COMMANDS ----
+    if message.content.startswith("!ping"):
+        await message.channel.send("🏓 Pong")
         return
 
-    await bot.process_commands(message)
+    if message.content.startswith("!warnings"):
+        if not is_admin(message.author):
+            return
+        if not message.mentions:
+            await message.channel.send("Mention a user.")
+            return
+        target = str(message.mentions[0].id)
+        count = warns.get(target, 0)
+        await message.channel.send(f"⚠️ Warnings: {count}/4")
+        return
 
-# ---------- COMMANDS ----------
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def warnings(ctx, member: discord.Member):
-    data = load_warnings()
-    await ctx.send(f"{member.mention} has {data.get(str(member.id), 0)} warnings.")
+    if message.content.startswith("!resetwarnings"):
+        if not is_admin(message.author):
+            return
+        if not message.mentions:
+            return
+        target = str(message.mentions[0].id)
+        warns[target] = 0
+        save_warns(warns)
+        await message.channel.send("✅ Warnings reset.")
+        return
 
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def clearwarnings(ctx, member: discord.Member):
-    data = load_warnings()
-    data[str(member.id)] = 0
-    save_warnings(data)
-    await ctx.send(f"Warnings cleared for {member.mention}")
+    if message.content.startswith("!warn"):
+        if not is_admin(message.author):
+            return
+        if not message.mentions:
+            return
+        target = str(message.mentions[0].id)
+        warns[target] = warns.get(target, 0) + 1
+        save_warns(warns)
+        await message.channel.send("⚠️ Manual warning issued.")
+        return
 
-@bot.command()
-@commands.has_permissions(ban_members=True)
-async def unban(ctx, user_id: int):
-    user = await bot.fetch_user(user_id)
-    await ctx.guild.unban(user)
-    await ctx.send(f"Unbanned {user}")
+    if message.content.startswith("!unban"):
+        if not is_admin(message.author):
+            return
+        parts = message.content.split()
+        if len(parts) != 2:
+            return
+        user_id = int(parts[1])
+        await message.guild.unban(discord.Object(id=user_id))
+        await message.channel.send("✅ User unbanned.")
+        return
 
-# ---------- AI CHAT ----------
-@bot.command()
-async def ask(ctx, *, question):
-    await ctx.send("🤖 Thinking...")
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role":"user","content": question}],
-            max_tokens=300,
-            temperature=0.7
+    # ---- AUTO MODERATION ----
+    score = behavior_score(message)
+
+    if score >= 3:
+        warns[uid] = warns.get(uid, 0) + 1
+        save_warns(warns)
+
+        await message.channel.send(
+            f"{message.author.mention} ⚠️ Warning {warns[uid]}/4 (spam/abuse behavior)"
         )
-        answer = response['choices'][0]['message']['content'].strip()
-        await ctx.send(f"💡 {answer}")
-    except Exception as e:
-        await ctx.send(f"⚠ Error: {str(e)}")
 
-# ---------- RUN ----------
+        if warns[uid] == 3:
+            await message.author.timeout(
+                discord.utils.utcnow() + discord.timedelta(minutes=10),
+                reason="Auto moderation"
+            )
+
+        if warns[uid] >= 4:
+            await message.author.ban(reason="Auto moderation: 4 warnings")
+            owner = message.guild.owner
+            if owner:
+                await owner.send(
+                    f"🚨 {message.author} was banned after 4 warnings."
+                )
+
 bot.run(TOKEN)

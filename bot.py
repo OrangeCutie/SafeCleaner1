@@ -1,118 +1,117 @@
 import discord
-import json
-import os
-from moderation import behavior_score
-from dotenv import load_dotenv
+from discord.ext import commands
+import sqlite3, os, time, re
+from openai import OpenAI
 
-load_dotenv()
+client_ai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WARN_LIMIT = 4
 
-bot = discord.Client(intents=intents)
+db = sqlite3.connect("database.db", check_same_thread=False)
+cur = db.cursor()
 
-WARN_FILE = "warnings.json"
+cur.execute("""
+CREATE TABLE IF NOT EXISTS warnings(
+ user_id TEXT,
+ guild_id TEXT,
+ reason TEXT,
+ content TEXT,
+ timestamp INTEGER
+)
+""")
+db.commit()
 
-def load_warns():
-    if not os.path.exists(WARN_FILE):
-        return {}
-    with open(WARN_FILE, "r") as f:
-        return json.load(f)
+def normalize(text):
+    return re.sub(r'[^a-z0-9]', '', text.lower())
 
-def save_warns(data):
-    with open(WARN_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+async def ai_toxicity(text):
+    response = client_ai.responses.create(
+        model="gpt-4.1-mini",
+        input=f"Is this message toxic, hateful, sexual, racist, or harassing? Answer YES or NO.\n{text}"
+    )
+    return "YES" in response.output_text.upper()
 
 def is_admin(member):
-    return member.guild_permissions.administrator
+    return member.guild_permissions.administrator or member == member.guild.owner
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    print("SafeCleaner online")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    warns = load_warns()
-    uid = str(message.author.id)
-
-    # ---- COMMANDS ----
-    if message.content.startswith("!ping"):
-        await message.channel.send("🏓 Pong")
+    toxic = await ai_toxicity(message.content)
+    if not toxic:
         return
 
-    if message.content.startswith("!warnings"):
-        if not is_admin(message.author):
-            return
-        if not message.mentions:
-            await message.channel.send("Mention a user.")
-            return
-        target = str(message.mentions[0].id)
-        count = warns.get(target, 0)
-        await message.channel.send(f"⚠️ Warnings: {count}/4")
-        return
+    await message.delete()
 
-    if message.content.startswith("!resetwarnings"):
-        if not is_admin(message.author):
-            return
-        if not message.mentions:
-            return
-        target = str(message.mentions[0].id)
-        warns[target] = 0
-        save_warns(warns)
-        await message.channel.send("✅ Warnings reset.")
-        return
+    cur.execute(
+        "INSERT INTO warnings VALUES (?,?,?,?,?)",
+        (str(message.author.id), str(message.guild.id),
+         "AI Toxicity", message.content, int(time.time()))
+    )
+    db.commit()
 
-    if message.content.startswith("!warn"):
-        if not is_admin(message.author):
-            return
-        if not message.mentions:
-            return
-        target = str(message.mentions[0].id)
-        warns[target] = warns.get(target, 0) + 1
-        save_warns(warns)
-        await message.channel.send("⚠️ Manual warning issued.")
-        return
+    cur.execute(
+        "SELECT COUNT(*) FROM warnings WHERE user_id=? AND guild_id=?",
+        (str(message.author.id), str(message.guild.id))
+    )
+    count = cur.fetchone()[0]
 
-    if message.content.startswith("!unban"):
-        if not is_admin(message.author):
-            return
-        parts = message.content.split()
-        if len(parts) != 2:
-            return
-        user_id = int(parts[1])
-        await message.guild.unban(discord.Object(id=user_id))
-        await message.channel.send("✅ User unbanned.")
-        return
-
-    # ---- AUTO MODERATION ----
-    score = behavior_score(message)
-
-    if score >= 3:
-        warns[uid] = warns.get(uid, 0) + 1
-        save_warns(warns)
-
-        await message.channel.send(
-            f"{message.author.mention} ⚠️ Warning {warns[uid]}/4 (spam/abuse behavior)"
+    try:
+        await message.author.send(
+            f"You were warned in **{message.guild.name}** ({count}/{WARN_LIMIT})\nReason: Toxic content"
         )
+    except:
+        pass
 
-        if warns[uid] == 3:
-            await message.author.timeout(
-                discord.utils.utcnow() + discord.timedelta(minutes=10),
-                reason="Auto moderation"
-            )
+    if count >= WARN_LIMIT:
+        await message.author.ban(reason="Auto moderation (4 warnings)")
 
-        if warns[uid] >= 4:
-            await message.author.ban(reason="Auto moderation: 4 warnings")
-            owner = message.guild.owner
-            if owner:
-                await owner.send(
-                    f"🚨 {message.author} was banned after 4 warnings."
-                )
+@bot.command()
+async def warn(ctx, member: discord.Member, *, reason):
+    if not is_admin(ctx.author):
+        return
+    cur.execute(
+        "INSERT INTO warnings VALUES (?,?,?,?,?)",
+        (str(member.id), str(ctx.guild.id),
+         reason, "Manual warn", int(time.time()))
+    )
+    db.commit()
+    await ctx.send(f"{member.mention} manually warned.")
 
-bot.run(TOKEN)
+@bot.command()
+async def warnings(ctx, member: discord.Member):
+    if not is_admin(ctx.author):
+        return
+    cur.execute(
+        "SELECT reason, content FROM warnings WHERE user_id=? AND guild_id=?",
+        (str(member.id), str(ctx.guild.id))
+    )
+    data = cur.fetchall()
+    if not data:
+        await ctx.send("No warnings.")
+        return
+    text = "\n".join([f"- {r}: {c}" for r,c in data])
+    await ctx.send(text)
+
+@bot.command()
+async def resetwarnings(ctx, member: discord.Member):
+    if not is_admin(ctx.author):
+        return
+    cur.execute(
+        "DELETE FROM warnings WHERE user_id=? AND guild_id=?",
+        (str(member.id), str(ctx.guild.id))
+    )
+    db.commit()
+    await ctx.send("Warnings reset.")
+
+bot.run(BOT_TOKEN)
